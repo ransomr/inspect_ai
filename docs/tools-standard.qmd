@@ -3,7 +3,7 @@ title: Standard Tools
 tbl-colwidths: [40,60]
 ---
 
-## Overview 
+## Overview
 
 {{< include _tools-standard.md >}}
 
@@ -37,8 +37,8 @@ web_search({"tavily": {"max_results": 5}})
 
 # multiple providers with options
 web_search({
-    "openai": True, 
-    "google": {"num_results": 5}, 
+    "openai": True,
+    "google": {"num_results": 5},
     "tavily": {"max_results": 5}
 })
 ```
@@ -142,7 +142,7 @@ To use the "google" provider you will need to set up your own Google Programmabl
 -   `GOOGLE_CSE_API_KEY` — Google API key used to enable the Search API
 
 
-Google supports the following options: 
+Google supports the following options:
 
 | Option | Description |
 |------------------------------------|------------------------------------|
@@ -167,7 +167,7 @@ def intercode_ctf():
         solver=[
             system_message("system.txt"),
             use_tools([
-                bash(CMD_TIMEOUT), 
+                bash(CMD_TIMEOUT),
                 python(CMD_TIMEOUT)
             ]),
             generate(),
@@ -261,7 +261,7 @@ Note that we provide a `timeout` for the bash session and text editor tools (thi
 
 ### Tool Binding
 
-The schema for the `text_editor()` tool is based on the standard Anthropic [text editor tool type](https://docs.anthropic.com/en/docs/agents-and-tools/computer-use#text-editor-tool). The `text_editor()` works with all models that support tool calling, but when using Claude, the text editor tool will automatically bind to the native Claude tool definition.
+The schema for the `text_editor()` tool is based on the standard Anthropic [text editor tool type](https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/text-editor-tool). The `text_editor()` works with all models that support tool calling, but when using Claude, the text editor tool will automatically bind to the native Claude tool definition.
 
 ## Web Browser {#sec-web-browser}
 
@@ -566,14 +566,14 @@ def swe_bench():
 
     tools = [
         bash_session(timeout=180),
-        text_editor(timeout=180),  
+        text_editor(timeout=180),
         think(dedent("""
             Use the think tool to think about something. It will not obtain
-            new information or make any changes to the repository, but just 
+            new information or make any changes to the repository, but just
             log the thought. Use it when complex reasoning or brainstorming
             is needed. For example, if you explore the repo and discover
             the source of a bug, call this tool to brainstorm several unique
-            ways of fixing the bug, and assess which change(s) are likely to 
+            ways of fixing the bug, and assess which change(s) are likely to
             be simplest and most effective. Alternatively, if you receive
             some test results, call this tool to brainstorm ways to fix the
             failing tests.
@@ -611,11 +611,11 @@ def swe_bench():
 
     think_system_message = system_message(dedent("""
         Use the think tool to think about something. It will not obtain
-        new information or make any changes to the repository, but just 
+        new information or make any changes to the repository, but just
         log the thought. Use it when complex reasoning or brainstorming
         is needed. For example, if you explore the repo and discover
         the source of a bug, call this tool to brainstorm several unique
-        ways of fixing the bug, and assess which change(s) are likely to 
+        ways of fixing the bug, and assess which change(s) are likely to
         be simplest and most effective. Alternatively, if you receive
         some test results, call this tool to brainstorm ways to fix the
         failing tests.
@@ -628,7 +628,7 @@ def swe_bench():
             think_system_message,
             use_tools([
                 bash_session(timeout=180),
-                text_editor(timeout=180),  
+                text_editor(timeout=180),
                 think(),
             ]),
             generate(),
