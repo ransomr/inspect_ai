@@ -563,6 +563,21 @@ finale of the third chain, but every primitive listed above occurs *before and
 independently of* any socket connection, and the first two chains never involve
 the socket at all. The two items are complementary, not alternatives.
 
+**The window is an ordering property, not a pattern property.** It is open
+whenever untrusted code executes in the container before the first injection.
+Pattern 1 opens it routinely: plain `bash()`/`python()` call
+`sandbox.exec()` directly and never trigger injection, so an agent that runs a
+shell command before its first stateful tool call acts while both directories
+are still absent. Pattern 2 closes it for the evaluated agent, because
+`sandbox_agent_bridge()` injects during setup (`sandbox/bridge.py:140`) and only
+yields to the agent afterwards — the directories already exist, root-owned and
+`0700`, before any agent code runs. Two corollaries follow: an eval configured
+with only stateful tools has no window either, since its first tool call
+performs the injection; and Pattern 2 is still exposed to anything that ran
+*earlier* in the container's life — entrypoints, `sample_init`, and task setup
+scripts — which matters wherever those are influenced by dataset content rather
+than fixed by the eval author.
+
 The fix: every site that creates or opens a privileged directory routes through
 a single helper that opens with `O_NOFOLLOW`, verifies ownership and type on the
 descriptor with `fstat`, applies the mode with `fchmod`, and **safely recreates**
