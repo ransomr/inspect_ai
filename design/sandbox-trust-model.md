@@ -345,6 +345,23 @@ One consequence is easy to miss. The bridge sets `concurrency`, `env`, and
 therefore inherits the daemon's identity, so **the model proxy runs as root** —
 and it is the unauthenticated loopback listener described below.
 
+**What that does and does not grant.** It does not by itself give a container
+process root: the proxy exposes model relay and bridged-tool invocation, and
+neither runs a command in the container. Root here is a blast-radius and
+least-privilege problem — a file-handling defect in a handler would be
+root-privileged, its mailbox files are root-owned, and it voids the "non-root,
+nothing to escalate to" reasoning used to justify permissive modes elsewhere.
+
+The escalation the bridge actually grants is **to host-side capability rather
+than to container root**: any container process can reach the proxy and invoke
+`call_tool`, executing a bridged tool inside the Inspect process, outside the
+container boundary, without passing the approval chokepoint. A route to
+container root exists only by configuration — `bridged_tools` accepts any
+`Tool`, so an author who bridges one that executes in the sandbox as a
+privileged user hands that to an unauthenticated caller. The bridge does not
+create the privilege; it removes the authentication and the approval gate in
+front of whatever was bridged.
+
 ### Where tool calls actually execute
 
 This is the most frequently misunderstood part of the architecture.
