@@ -787,6 +787,77 @@ hardening items above. Identifiers are Claude Security finding ids.
 | 3672961 | Digest mismatch only warns; unverified binary run as root | 5 |
 | 3672973 | Command injection via unquoted path in shell string | 5 |
 
+## Worked example: approval bypass via the bridge (findings 3672035, 3672977)
+
+> **Sensitive.** A concrete, runnable proof of concept. Redact this section
+> before any external distribution.
+
+The most instructive chain uses only supported configuration and no
+misconfiguration. It demonstrates two findings at once and shows why item 4
+needs both of its parts.
+
+**Setup.** A Pattern 2 eval — `sandbox_agent_bridge()` — registers at least one
+`bridged_tools` spec, the supported way to give a sandboxed agent host-side
+tools. An approval policy gates one of those tools; call it `run_sql`, which the
+operator wants confirmed before each call.
+
+**Intended flow.** The model proposes `run_sql`; `apply_bridge_tool_approval`
+inspects the proposal on the *generate* path (`agent/_bridge/util.py:341`) and
+consults the approver; only an approved proposal returns for the agent to
+execute. Approval lives on the generate chokepoint.
+
+**Exploit — never generate.** The agent already holds the bridged tools' MCP URL
+(`http://localhost:13131/mcp/host_tools`). `call_tool` on that endpoint checks
+only *is this a registered tool* (`server in bridge.bridged_tools`,
+`tool in server_tools`), never *was this approved*.
+
+1. Enumerate (optional — the agent is handed these, but the endpoint answers
+   anyone):
+
+   ```bash
+   curl -s --max-time 10 http://localhost:13131/mcp/host_tools \
+     -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+   ```
+
+2. Invoke the gated tool directly, skipping the model round trip:
+
+   ```bash
+   curl -s --max-time 10 http://localhost:13131/mcp/host_tools \
+     -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+          "params":{"name":"run_sql","arguments":{"query":"DROP TABLE users"}}}'
+   ```
+
+The proxy writes a `call_tool` request into the mailbox; the host `find`/`cat`s
+it and runs `await run_sql(query="DROP TABLE users")` in the Inspect process,
+outside the container, with the host's credentials. No approver is consulted and
+no `ToolEvent` is recorded (`agent/_bridge/sandbox/service.py` contains neither);
+the configured policy never fires.
+
+**Amplifiers, same endpoint, same position.**
+
+- **No authentication**, so this is not limited to the agent scaffold — any
+  process at any uid in the container can issue those requests. The test suite
+  drives `call_tool` exactly this way, over `sandbox().exec(["curl", …])`.
+- The `/v1/*` routes on the same proxy relay to the real model with the
+  operator's credentials — unmetered generation, and fabricated output foldable
+  into scored state.
+
+**Scope, stated precisely.** This does not by itself give container root:
+`run_sql` runs with whatever authority the author gave that tool in the host
+process. The breach is mediation and capability — acting outside the container,
+unapproved and unlogged — not privilege escalation inside it. Container root via
+this path follows only if the author bridged a tool that itself runs privileged
+in the sandbox (e.g. `bash(user="root")`), at which point the same two requests
+yield root in the container too.
+
+**Why item 4 needs both parts.** Authenticating the proxy stops the
+co-resident-process variant but not the agent itself, which is a legitimate
+peer of the proxy; routing `call_tool` through the approval chain (and emitting
+a `ToolEvent`) closes the bypass for the agent but leaves an unauthenticated
+root listener for every other container process. Neither half suffices alone.
+
 ## Adopting this document
 
 The value of writing the boundary down is that new components can be checked
