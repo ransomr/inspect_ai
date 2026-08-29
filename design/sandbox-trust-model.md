@@ -529,11 +529,46 @@ descriptor on the socket.
 
 ### 1. One verified-directory helper, used everywhere
 
-Every site that creates or opens a privileged directory routes through a single
-helper that opens with `O_NOFOLLOW`, verifies ownership and type on the
+**This is remediation, not hardening.** Four preconditions combine into working
+attacks, and each is verifiable in the source: `/tmp` and `/var/tmp` are
+world-writable and sticky; injection detection is a bare readability check
+(`sandbox_file_detector` → `_is_file_readable`, `util/_sandbox/context.py:169`)
+with no ownership or integrity test; `mkdir -p` and `mkdir(exist_ok=True)` adopt
+a pre-existing directory without checking who owns it; and `chmod 700` changes
+the mode but not the owner, who can simply change it back. The agent gets its
+window because plain `bash()` requires no injection, so it can act before the
+tools tree or the server directory exist at all.
+
+Three chains follow, with different endpoints:
+
+- **Plant the tools *directory*.** Injection proceeds into a directory the agent
+  owns, extracts into it, and then runs `[SANDBOX_CLI, "start-server"]` as root
+  (`tool/_sandbox_tools_utils/sandbox.py:114-141`). The agent owns the tree
+  during that window and can swap the launcher that root executes → **root code
+  execution.**
+- **Plant the CLI *file*.** The detector sees a readable file at the expected
+  path and injection is skipped entirely, so `_tools_user` is never set and the
+  host's tool RPCs are served by the agent's binary → **forged tool results and
+  bypass of per-user execution isolation.** Integrity rather than escalation,
+  but it corrupts exactly the results an eval is measuring.
+- **Plant the server directory.** The root CLI then opens `server-start.lock`,
+  `server-stdout.log`, and `server-stderr.log` inside it with symlink-following
+  `open(..., "a")` (`_cli/main.py:203-229`) → **arbitrary root file
+  creation/append**; the daemon's path-based `os.chmod(SERVER_DIR, 0o700)`
+  follows a symlinked directory → **arbitrary root chmod**; and `server.pid`
+  becomes attacker-writable input to a root `terminate()`/`kill()`.
+
+**Item 2 does not cover this.** Peer authentication blocks the socket-based
+finale of the third chain, but every primitive listed above occurs *before and
+independently of* any socket connection, and the first two chains never involve
+the socket at all. The two items are complementary, not alternatives.
+
+The fix: every site that creates or opens a privileged directory routes through
+a single helper that opens with `O_NOFOLLOW`, verifies ownership and type on the
 descriptor with `fstat`, applies the mode with `fchmod`, and **safely recreates**
 rather than adopting a directory that fails the check. This is the discipline
-`json_rpc_chunking.py` already implements.
+`json_rpc_chunking.py` already implements. Injection detection additionally
+needs to verify what it adopts, rather than trusting a path's existence.
 
 Recreating rather than refusing matters: refusing to start converts a squatted
 directory into an availability failure, while safe recreation removes the
