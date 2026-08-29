@@ -96,7 +96,7 @@ The injected executable is not one daemon; it is a multi-call binary
 |---|---|---|---|
 | **Tools CLI** (`exec`) | One per host tool call | Started as `_tools_user` (root); may `setuid` down to `_run_as_user` for in-process tools | Executes *stateless* tools itself; otherwise acts as a client to the daemon |
 | **Server daemon** (`start-server`) | Container lifetime | root, stays root | *Stateful* tools; switches user per job via `preexec_fn` |
-| **Model proxy** (`model_proxy`) | Bridge session (Pattern 2 only) | Spawned by the daemon as an `exec_remote` job | Relays model calls from a sandboxed agent |
+| **Model proxy** (`model_proxy`) | Bridge session (Pattern 2 only) | root — spawned by the daemon as an `exec_remote` job with no `user`, so it inherits the daemon's identity | Relays model calls from a sandboxed agent |
 | **Command processes** | Per command | Agent user, or a user named by the caller | The actual work |
 
 The CLI routes on a static list (`_cli/main.py:151-194`): if the requested
@@ -329,6 +329,22 @@ injected executable hosts the proxy (`exec_remote([SANDBOX_CLI, "model_proxy"])`
 `agent/_bridge/sandbox/bridge.py:207-217`), but this is an entirely separate RPC
 system from Pattern 1 — no shared transport, opposite direction.
 
+**What Pattern 2 uses the tools tree for.** Not the agent's tools: those the
+agent executes itself, in-container, without the CLI or the daemon. The tree is
+used to stand up the bridge. `sandbox_agent_bridge()` calls
+`sandbox_with_injected_tools()` (`sandbox/bridge.py:140`), and the proxy is
+started as an `exec_remote` job — so the injected binary *is* the proxy program,
+and because `exec_remote` is a stateful tool, that one launch traverses the
+whole Pattern 1 stack: host → CLI (root) → daemon (root) → proxy. After startup
+the agent talks only to the proxy over loopback and never reaches the CLI or
+daemon again.
+
+One consequence is easy to miss. The bridge sets `concurrency`, `env`, and
+`poll_timeout` but not `options.user`, and the target user is forwarded only
+`if self._options.user` (`util/_sandbox/exec_remote.py:320-321`). The job
+therefore inherits the daemon's identity, so **the model proxy runs as root** —
+and it is the unauthenticated loopback listener described below.
+
 ### Where tool calls actually execute
 
 This is the most frequently misunderstood part of the architecture.
@@ -483,7 +499,8 @@ with the target user an ordinary wire parameter (`SubmitParams.user`,
 (`_job.py:74-101`). The effective rule is *"if this daemon is root, any socket
 client may name any user, including root."*
 
-The bridge proxy is unauthenticated on container loopback
+The bridge proxy — which runs as root, per the note above — is unauthenticated
+on container loopback
 (`_agent_bridge/proxy.py:52-58`, port 13131), which every process and uid in the
 container shares, and serves `Access-Control-Allow-Origin: *`
 (`proxy.py:197-205`) to browsed content. Its handlers call `os._exit(1)` on
