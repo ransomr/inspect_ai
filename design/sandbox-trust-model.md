@@ -291,7 +291,7 @@ sequenceDiagram
         participant SA as sandboxed agent
         participant PX as model proxy<br/>127.0.0.1:13131
     end
-    box rgb(230, 230, 230) Shared filesystem
+    box rgb(230, 230, 230) Container filesystem, polled by the host via exec
         participant MB as /var/tmp/sandbox-services<br/>mailbox (parent 1777)
     end
     box rgb(220, 235, 255) Inspect host process
@@ -523,6 +523,17 @@ container shares, and serves `Access-Control-Allow-Origin: *`
 (`proxy.py:197-205`) to browsed content. Its handlers call `os._exit(1)` on
 error (`proxy.py:1417`, `:1639`). Its backing mailbox sits under a `1777` parent
 (`util/_sandbox/service.py:29-30`).
+
+The route by which an in-container caller reaches host-side execution is worth
+stating in full, because no step in it is an escape — every step is the designed
+mechanism. A `tools/call` to `http://localhost:<port>/mcp/<server>` becomes a
+`call_tool` request file in the container mailbox; the host discovers it by
+`find`/`cat` over `sandbox.exec` (`util/_sandbox/service.py:299-362`), looks the
+method up, and runs `await tool_fn(**arguments)` in the Inspect process
+(`agent/_bridge/sandbox/service.py:190`). The tool code never enters the
+container: the agent holds only an MCP URL. The checks on that path are
+`server in bridge.bridged_tools` and `tool in server_tools` — *is this a
+registered tool*, not *is this caller allowed* or *was this approved*.
 
 Separately, `call_tool` (`agent/_bridge/sandbox/service.py:177-199`) is a second,
 independently reachable route to host-side tool execution that does not pass
