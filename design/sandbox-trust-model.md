@@ -287,7 +287,7 @@ maintained independently at each call site rather than by the protocol: a future
 tool that builds its params as `{**model_args}` would make it live, and nothing
 would catch that.
 
-These need separate fixes. Hardening item 2 removes the attack: once only the
+These need separate fixes. Hardening item 3 removes the attack: once only the
 host's root CLI can reach the socket, no unauthenticated caller can name its own
 user. Fail-open is not covered by it and must be fixed on its own, because it
 misfires on a legitimate call that simply omits the field — confinement should
@@ -587,11 +587,13 @@ intended to become.
 
 ## Proposed hardening
 
-Ordered by leverage. The first two are independent and both are required:
-verified directories control *reachability*, peer authentication controls
-*identity*. Neither substitutes for the other, because a correctly permissioned
-directory still hands out privileged operations to anything that obtains a
-descriptor on the socket.
+Ordered by leverage and dependency. Item 2 depends on item 1: direct archive
+streaming is safe only after the extraction destination has been verified.
+Items 1 and 3 are independent and both are required: verified directories
+control *reachability*, while peer authentication controls *identity*. Neither
+substitutes for the other, because a correctly permissioned directory still
+hands out privileged operations to anything that obtains a descriptor on the
+socket.
 
 ### 1. One verified-directory helper, used everywhere
 
@@ -624,7 +626,7 @@ Three chains follow, with different endpoints:
   follows a symlinked directory → **arbitrary root chmod**; and `server.pid`
   becomes attacker-writable input to a root `terminate()`/`kill()`.
 
-**Item 2 does not cover this.** Peer authentication blocks the socket-based
+**Item 3 does not cover this.** Peer authentication blocks the socket-based
 finale of the third chain, but every primitive listed above occurs *before and
 independently of* any socket connection, and the first two chains never involve
 the socket at all. The two items are complementary, not alternatives.
@@ -654,7 +656,7 @@ needs to verify what it adopts, rather than trusting a path's existence.
 Recreating rather than refusing matters: refusing to start converts a squatted
 directory into an availability failure, while safe recreation removes the
 attacker's position and continues. Applies to `SERVER_DIR` at both creation
-sites, the tools tree, the staging path, and the equivalent directories in
+sites, the tools tree, and the equivalent directories in
 `agent/_human/install.py`. Root-side reads that validate by path and then reopen
 by path (`json_rpc_chunking.py:200-218`) resolve once and read from the verified
 descriptor.
@@ -665,7 +667,32 @@ next component cannot reintroduce the pattern.
 This is stateless: no bookkeeping, works when reconnecting to a pre-existing
 container, and cannot be defeated by discovery.
 
-### 2. Same-UID, mutual peer authentication on both tool sockets
+### 2. Stream the tools archive without staging
+
+**Depends on item 1.** The fixed `.pkg.tgz` and `.pkg.tar` paths are removed.
+`_extract_tools_tree()` base64-encodes the host-selected artifact bytes, supplies
+that text as stdin to a single `sandbox.exec()` running as the tools user, and
+has that process decode directly into tar's stdin:
+
+```text
+base64 -d | tar xzf - -C <verified-tools-dir>
+```
+
+The gzip-less fallback repeats the same operation with the host-decompressed tar
+and `tar xf -`. No container filesystem object exists between the bytes selected
+by the host and the archive descriptor consumed by root, so there is no path for
+the agent to pre-create, replace, symlink, or modify between transfer and
+extraction. The destination must already have passed the ownership, type, and
+`0700` checks above; a non-zero decoder or tar result fails injection. This does
+not replace item 6's source-authenticity check: strict digests establish which
+bytes the host may send, while direct streaming preserves that binding through
+root extraction.
+
+A mechanical test should assert that injection never writes a tools archive into
+the container filesystem, preventing a later refactor from restoring the
+staging race.
+
+### 3. Same-UID, mutual peer authentication on both tool sockets
 
 Both ends authenticate the peer before exchanging a request. The server drops a
 connection whose peer UID differs from its own UID, before parsing a byte. The
@@ -705,14 +732,14 @@ before forwarding, making "caller uid X may request only user X" meaningful.
 Nor does it fix the fail-open default in tool user confinement, which misfires
 on legitimate calls rather than under attack and needs its own fix.
 
-### 3. Unpredictable capability handles for sessions and jobs
+### 4. Unpredictable capability handles for sessions and jobs
 
 Replace sequential session names and raw PIDs with `secrets.token_hex()` handles
 returned only to the creator and checked on every operation. If a future
 authentication design admits multiple principals, bind each handle to the
 authenticated creator as an additional check.
 
-**Exploitable today.** Before item 2 lands, any container process that reaches
+**Exploitable today.** Before item 3 lands, any container process that reaches
 the socket can name `BashSession` or `WebBrowser` — the namespace is fully
 enumerable — and act on a session it did not create. `session_for_name` is a
 bare dict lookup, so naming is sufficient. Concretely: the model's browser
@@ -722,7 +749,7 @@ session created with `user=` yields a shell as that user; and for `exec_remote`,
 a guessed PID accepts `exec_remote_write_stdin`, injecting input into a
 root-owned job.
 
-**After item 2.** This becomes defense in depth rather than an independently
+**After item 3.** This becomes defense in depth rather than an independently
 load-bearing cross-UID control: a process under another UID cannot reach either
 server. Capability handles still limit damage from a leaked socket descriptor,
 a same-UID co-process, or a future authentication regression. Peer credentials
@@ -730,7 +757,7 @@ cannot distinguish processes that deliberately share a UID, so the random
 handle itself is the authority in that case; describing this as UID-based owner
 isolation would overstate the boundary.
 
-### 3a. `Job.kill()` process-state guard — a correctness fix
+### 4a. `Job.kill()` process-state guard — a correctness fix
 
 Distinct from the above, and not a security fix. `kill()` gates on
 `self._state != "running"`, but `_state` only advances to `"completed"` inside
@@ -742,7 +769,7 @@ a live, unrelated group. This misfires for a legitimate caller with no attacker
 present, so it belongs with the fail-open default rather than with
 authorization.
 
-### 4. Bridge: authenticate the proxy and close the second entry point
+### 5. Bridge: authenticate the proxy and close the second entry point
 
 The model proxy issues a per-run bearer token, delivered by the same mechanism
 that already carries its base URL. CORS is disabled or restricted to an explicit
@@ -753,7 +780,7 @@ Separately, `call_tool` must pass through the same approval chain as any other
 tool call and emit a `ToolEvent`. This preserves the single-chokepoint design
 rather than replacing it, and closes the observability gap noted above.
 
-### 5. Verify what runs as root
+### 6. Verify what runs as root
 
 `INSPECT_SANDBOX_TOOLS_STRICT_DIGESTS` becomes enforcing by default, since the
 artifact is executed as the tools user. Privileged components stop consuming
@@ -801,24 +828,24 @@ hardening items above. Identifiers are Claude Security finding ids.
 
 | Finding | Summary | Item |
 |---|---|---|
-| 3672032 | Pre-occupied server dir reaches root RPC server | 1, 2 |
+| 3672032 | Pre-occupied server dir reaches root RPC server | 1, 3 |
 | 3672959 | Pre-created tools dir swaps root-executed launcher | 1 |
-| 3672960 | Archive staged unprivileged, extracted by root | 1, 5 |
+| 3672960 | Archive staged unprivileged, extracted by root | 1, 2, 6 |
 | 3672962 | Agent-created file at CLI path spoofs injection detector | 1 |
-| 3672970 | Root tool deserializes attacker-plantable pickle | 1, 5 |
+| 3672970 | Root tool deserializes attacker-plantable pickle | 1, 6 |
 | 3673732 | CLI trusts agent-writable pid/lock/status files | 1 |
 | 3673733 | Symlink race in per-uid chunk dirs | 1 |
 | 3673720 | Human-agent installer stages in preparable directory | 1 |
-| 3672040 | Non-root server exposes exec RPC to every container user | 2 |
-| 3673753 | Tool server binds world-connectable socket | 1, 2 |
-| 3674518 | CLI accepts any live socket as the intended tool server | 1, 2 |
-| 3673741 | Predictable session names permit session hijack | 3 |
-| 3672038 | PID-reuse race in root `killpg` | 3a |
-| 3672977 | Unauthenticated loopback model proxy | 4 |
-| 3672978 | Bridge mailbox world-readable to container uids | 4 |
-| 3672035 | Bridge `call_tool` bypasses approval enforcement | 4 |
-| 3672961 | Digest mismatch only warns; unverified binary run as root | 5 |
-| 3672973 | Command injection via unquoted path in shell string | 5 |
+| 3672040 | Non-root server exposes exec RPC to every container user | 3 |
+| 3673753 | Tool server binds world-connectable socket | 1, 3 |
+| 3674518 | CLI accepts any live socket as the intended tool server | 1, 3 |
+| 3673741 | Predictable session names permit session hijack | 4 |
+| 3672038 | PID-reuse race in root `killpg` | 4a |
+| 3672977 | Unauthenticated loopback model proxy | 5 |
+| 3672978 | Bridge mailbox world-readable to container uids | 5 |
+| 3672035 | Bridge `call_tool` bypasses approval enforcement | 5 |
+| 3672961 | Digest mismatch only warns; unverified binary run as root | 6 |
+| 3672973 | Command injection via unquoted path in shell string | 6 |
 
 ## Worked example: approval bypass via the bridge (findings 3672035, 3672977)
 
@@ -826,7 +853,7 @@ hardening items above. Identifiers are Claude Security finding ids.
 > before any external distribution.
 
 The most instructive chain uses only supported configuration and no
-misconfiguration. It demonstrates two findings at once and shows why item 4
+misconfiguration. It demonstrates two findings at once and shows why item 5
 needs both of its parts.
 
 **Setup.** A Pattern 2 eval — `sandbox_agent_bridge()` — registers at least one
@@ -885,7 +912,7 @@ this path follows only if the author bridged a tool that itself runs privileged
 in the sandbox (e.g. `bash(user="root")`), at which point the same two requests
 yield root in the container too.
 
-**Why item 4 needs both parts.** Authenticating the proxy stops the
+**Why item 5 needs both parts.** Authenticating the proxy stops the
 co-resident-process variant but not the agent itself, which is a legitimate
 peer of the proxy; routing `call_tool` through the approval chain (and emitting
 a `ToolEvent`) closes the bypass for the agent but leaves an unauthenticated
