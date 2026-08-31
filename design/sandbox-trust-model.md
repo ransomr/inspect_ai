@@ -593,7 +593,8 @@ Items 1 and 3 are independent and both are required: verified directories
 control *reachability*, while peer authentication controls *identity*. Neither
 substitutes for the other, because a correctly permissioned directory still
 hands out privileged operations to anything that obtains a descriptor on the
-socket.
+socket. Item 4 is independent again: authenticating the browser's caller does
+not make every browser navigation safe.
 
 ### 1. One verified-directory helper, used everywhere
 
@@ -684,7 +685,7 @@ by the host and the archive descriptor consumed by root, so there is no path for
 the agent to pre-create, replace, symlink, or modify between transfer and
 extraction. The destination must already have passed the ownership, type, and
 `0700` checks above; a non-zero decoder or tar result fails injection. This does
-not replace item 6's source-authenticity check: strict digests establish which
+not replace item 7's source-authenticity check: strict digests establish which
 bytes the host may send, while direct streaming preserves that binding through
 root extraction.
 
@@ -732,7 +733,35 @@ before forwarding, making "caller uid X may request only user X" meaningful.
 Nor does it fix the fail-open default in tool user confinement, which misfires
 on legitimate calls rather than under attack and needs its own fix.
 
-### 4. Unpredictable capability handles for sessions and jobs
+### 4. Restrict the privileged browser to web URLs
+
+`web_go` accepts only `http` and `https` navigation. The model-facing wrapper
+may reject other schemes early for a useful tool error, but the authoritative
+check belongs in `PageCrawler.go_to_url()`, immediately before `page.goto()`, so
+it also covers a caller that reaches the legacy socket directly. Scheme-less
+input continues to normalize to `https`; explicit schemes are parsed and
+compared case-insensitively against the allowlist. Ambiguous or malformed input
+is rejected rather than repaired.
+
+This is remediation for finding 3673737. Today, `file://`, `chrome://`,
+`view-source:`, and similar URLs reach driver-initiated Chromium navigation
+unchanged. When the legacy browser runs as root, a model-authorized call such as
+`file:///etc/shadow` reads with root authority and returns the result through
+the accessibility tree. Item 3 does not prevent that call: same-UID peer
+authentication excludes an unintended socket client, but the evaluated model
+is the intended caller and the browser is the confused deputy.
+
+As defense in depth, Chromium runs as a dedicated non-root browser user even
+when its supervising tool service is privileged. This limits filesystem
+disclosure if scheme validation regresses and should remain true when browser
+support migrates from `inspect_tool_support` to `inspect_sandbox_tools`.
+
+An end-to-end test at the model-facing tool boundary should prove that
+`file:///etc/passwd`, `file:/etc/passwd`, mixed-case schemes, leading
+whitespace, `chrome://`, and `view-source:` all fail without returning local
+content, while ordinary `http`, `https`, and scheme-less web URLs still work.
+
+### 5. Unpredictable capability handles for sessions and jobs
 
 Replace sequential session names and raw PIDs with `secrets.token_hex()` handles
 returned only to the creator and checked on every operation. If a future
@@ -757,7 +786,7 @@ cannot distinguish processes that deliberately share a UID, so the random
 handle itself is the authority in that case; describing this as UID-based owner
 isolation would overstate the boundary.
 
-### 4a. `Job.kill()` process-state guard — a correctness fix
+### 5a. `Job.kill()` process-state guard — a correctness fix
 
 Distinct from the above, and not a security fix. `kill()` gates on
 `self._state != "running"`, but `_state` only advances to `"completed"` inside
@@ -769,7 +798,7 @@ a live, unrelated group. This misfires for a legitimate caller with no attacker
 present, so it belongs with the fail-open default rather than with
 authorization.
 
-### 5. Bridge: authenticate the proxy and close the second entry point
+### 6. Bridge: authenticate the proxy and close the second entry point
 
 The model proxy issues a per-run bearer token, delivered by the same mechanism
 that already carries its base URL. CORS is disabled or restricted to an explicit
@@ -780,7 +809,7 @@ Separately, `call_tool` must pass through the same approval chain as any other
 tool call and emit a `ToolEvent`. This preserves the single-chokepoint design
 rather than replacing it, and closes the observability gap noted above.
 
-### 6. Verify what runs as root
+### 7. Verify what runs as root
 
 `INSPECT_SANDBOX_TOOLS_STRICT_DIGESTS` becomes enforcing by default, since the
 artifact is executed as the tools user. Privileged components stop consuming
@@ -830,22 +859,23 @@ hardening items above. Identifiers are Claude Security finding ids.
 |---|---|---|
 | 3672032 | Pre-occupied server dir reaches root RPC server | 1, 3 |
 | 3672959 | Pre-created tools dir swaps root-executed launcher | 1 |
-| 3672960 | Archive staged unprivileged, extracted by root | 1, 2, 6 |
+| 3672960 | Archive staged unprivileged, extracted by root | 1, 2, 7 |
 | 3672962 | Agent-created file at CLI path spoofs injection detector | 1 |
-| 3672970 | Root tool deserializes attacker-plantable pickle | 1, 6 |
+| 3672970 | Root tool deserializes attacker-plantable pickle | 1, 7 |
 | 3673732 | CLI trusts agent-writable pid/lock/status files | 1 |
 | 3673733 | Symlink race in per-uid chunk dirs | 1 |
 | 3673720 | Human-agent installer stages in preparable directory | 1 |
 | 3672040 | Non-root server exposes exec RPC to every container user | 3 |
 | 3673753 | Tool server binds world-connectable socket | 1, 3 |
 | 3674518 | CLI accepts any live socket as the intended tool server | 1, 3 |
-| 3673741 | Predictable session names permit session hijack | 4 |
-| 3672038 | PID-reuse race in root `killpg` | 4a |
-| 3672977 | Unauthenticated loopback model proxy | 5 |
-| 3672978 | Bridge mailbox world-readable to container uids | 5 |
-| 3672035 | Bridge `call_tool` bypasses approval enforcement | 5 |
-| 3672961 | Digest mismatch only warns; unverified binary run as root | 6 |
-| 3672973 | Command injection via unquoted path in shell string | 6 |
+| 3673737 | Browser accepts privileged local URL schemes | 4 |
+| 3673741 | Predictable session names permit session hijack | 5 |
+| 3672038 | PID-reuse race in root `killpg` | 5a |
+| 3672977 | Unauthenticated loopback model proxy | 6 |
+| 3672978 | Bridge mailbox world-readable to container uids | 6 |
+| 3672035 | Bridge `call_tool` bypasses approval enforcement | 6 |
+| 3672961 | Digest mismatch only warns; unverified binary run as root | 7 |
+| 3672973 | Command injection via unquoted path in shell string | 7 |
 
 ## Worked example: approval bypass via the bridge (findings 3672035, 3672977)
 
@@ -853,7 +883,7 @@ hardening items above. Identifiers are Claude Security finding ids.
 > before any external distribution.
 
 The most instructive chain uses only supported configuration and no
-misconfiguration. It demonstrates two findings at once and shows why item 5
+misconfiguration. It demonstrates two findings at once and shows why item 6
 needs both of its parts.
 
 **Setup.** A Pattern 2 eval — `sandbox_agent_bridge()` — registers at least one
@@ -912,7 +942,7 @@ this path follows only if the author bridged a tool that itself runs privileged
 in the sandbox (e.g. `bash(user="root")`), at which point the same two requests
 yield root in the container too.
 
-**Why item 5 needs both parts.** Authenticating the proxy stops the
+**Why item 6 needs both parts.** Authenticating the proxy stops the
 co-resident-process variant but not the agent itself, which is a legitimate
 peer of the proxy; routing `call_tool` through the approval chain (and emitting
 a `ToolEvent`) closes the bypass for the agent but leaves an unauthenticated
