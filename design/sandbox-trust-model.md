@@ -665,20 +665,34 @@ next component cannot reintroduce the pattern.
 This is stateless: no bookkeeping, works when reconnecting to a pre-existing
 container, and cannot be defeated by discovery.
 
-### 2. Peer-credential authentication on both tool sockets
+### 2. Same-UID, mutual peer authentication on both tool sockets
 
-The server drops connections whose peer UID is not the tools user, before
-parsing a request, reusing `peer_uid` and the protocol-level integration already
-proven in `_control/server.py`.
+Both ends authenticate the peer before exchanging a request. The server drops a
+connection whose peer UID differs from its own UID, before parsing a byte. The
+CLI likewise verifies that a connected socket's peer UID matches its own before
+treating the server as live or forwarding a request. This reuses `peer_uid` and
+the protocol-level integration already proven in `_control/server.py`, extended
+to the client side so a rogue listener cannot impersonate the daemon.
 
 This is the control that actually addresses discovery — it does not matter that
 the agent can enumerate the socket path from `/proc/net/unix`. It renders
 `_can_switch_user` moot as an escalation vector: that flag remains a privilege
 test, but the question it was standing in for — *may this caller switch user?* —
-is now answered at the connection, before any request is parsed. It is also the
-only control that helps wherever the daemon runs non-root but the agent runs as
-a different uid, since there the runtime directory is deliberately `0777` and
-ownership confers no protection at all.
+is now answered at the connection, before any request is parsed. Client-side
+verification closes the converse failure: `_can_connect_to_socket()` currently
+treats any live listener as the intended server and suppresses legitimate server
+startup (finding 3674518).
+
+The same-UID rule applies to both packages. `inspect_tool_support` currently
+creates a `0666` socket under the stated rationale that root, non-root, and
+different non-root users may all need to connect
+(`inspect_tool_support/_cli/server.py:27-39`), but no current `web_browser()`
+call site requests a different execution user: the CLI and the on-demand server
+both run as the sandbox default user. That nominal cross-UID support is removed,
+not carried forward as an authentication exception. Its socket moves to an
+owner-verified private directory and no longer uses a world-connectable mode.
+If a future feature genuinely requires cross-UID callers, it needs a separately
+designed allow-list or capability protocol rather than reopening this socket.
 
 Note what this does *not* require, and what it does not fix. It does not require
 an allow-list of permissible target users: once the only authenticated caller is
@@ -691,10 +705,12 @@ before forwarding, making "caller uid X may request only user X" meaningful.
 Nor does it fix the fail-open default in tool user confinement, which misfires
 on legitimate calls rather than under attack and needs its own fix.
 
-### 3. Unpredictable, owner-bound session and job handles
+### 3. Unpredictable capability handles for sessions and jobs
 
 Replace sequential session names and raw PIDs with `secrets.token_hex()` handles
-recorded against the creating principal and checked on every operation.
+returned only to the creator and checked on every operation. If a future
+authentication design admits multiple principals, bind each handle to the
+authenticated creator as an additional check.
 
 **Exploitable today.** Before item 2 lands, any container process that reaches
 the socket can name `BashSession` or `WebBrowser` — the namespace is fully
@@ -706,18 +722,13 @@ session created with `user=` yields a shell as that user; and for `exec_remote`,
 a guessed PID accepts `exec_remote_write_stdin`, injecting input into a
 root-owned job.
 
-**Where it remains load-bearing after item 2.** Under a single-uid peer check
-this becomes defense in depth — the agent cannot connect at all. But a
-single-uid check is not available everywhere: `inspect_tool_support` binds its
-`0666` socket *deliberately* to admit several principals, enumerating them in
-the source — "root creates socket, non-root clients connect later; non-root
-creates socket, root connects later; non-root1 creates socket, non-root2
-connects later" (`inspect_tool_support/_cli/server.py:27-39`) — and the
-sandbox-tools server likewise uses mode `0o777` when non-root. In those
-configurations peer authentication can establish *which* uid is calling but
-cannot stop uid A from naming uid B's session, because the handle carries no
-owner. **This is the configuration that justifies item 3 independently rather
-than as redundancy.**
+**After item 2.** This becomes defense in depth rather than an independently
+load-bearing cross-UID control: a process under another UID cannot reach either
+server. Capability handles still limit damage from a leaked socket descriptor,
+a same-UID co-process, or a future authentication regression. Peer credentials
+cannot distinguish processes that deliberately share a UID, so the random
+handle itself is the authority in that case; describing this as UID-based owner
+isolation would overstate the boundary.
 
 ### 3a. `Job.kill()` process-state guard — a correctness fix
 
@@ -800,6 +811,7 @@ hardening items above. Identifiers are Claude Security finding ids.
 | 3673720 | Human-agent installer stages in preparable directory | 1 |
 | 3672040 | Non-root server exposes exec RPC to every container user | 2 |
 | 3673753 | Tool server binds world-connectable socket | 1, 2 |
+| 3674518 | CLI accepts any live socket as the intended tool server | 1, 2 |
 | 3673741 | Predictable session names permit session hijack | 3 |
 | 3672038 | PID-reuse race in root `killpg` | 3a |
 | 3672977 | Unauthenticated loopback model proxy | 4 |
