@@ -238,6 +238,23 @@ deliberately absent from the model-facing schema: `bash()` advertises
 (`tool/_tools/_execute.py:94-121`). **The model chooses what to run, never as
 whom**, and must not be able to change it.
 
+For example, an eval author who wants a bash session confined to the `nobody`
+user configures it when constructing the tool:
+
+```python
+use_tools([bash_session(user="nobody")])
+```
+
+Omitting `user` does **not** currently mean the sandbox's default user for
+injected tools. In a root-capable sandbox, `bash_session()` submits no target
+user and its shell therefore inherits the root daemon's identity;
+`text_editor()` supplies no `_run_as_user` field and therefore remains in the
+root CLI process. The corresponding defaults grant the model root-authority
+tool operations. An eval that intends to preserve the agent/tools privilege
+split must explicitly name a non-root user for these tools. Plain `bash()` and
+`python()` are different: their omitted `user` is passed directly to
+`sandbox.exec()` and therefore selects the sandbox's default user.
+
 The contract holds against the model itself. Host-side construction is
 deliberately defensive: `text_editor` builds its RPC params by filtering
 `locals()` to the signature of the model-facing `execute`, then adds
@@ -420,7 +437,11 @@ answer for a given defect.
 
 The guarantees:
 
-1. The evaluated agent cannot execute code as the tools user. *(A)*
+1. Unless the eval author grants a model-facing tool the tools user's authority,
+   the evaluated agent cannot execute code as the tools user. In the current
+   implementation, omitting `user` from `bash_session()` or `text_editor()` in a
+   root-capable sandbox constitutes such a grant; a hardened API should make
+   that grant explicit rather than deriving it from an omitted field. *(A)*
 2. The evaluated agent cannot read, replace, or redirect the tools tree, the
    server runtime directory, or their contents. *(A)*
 3. The evaluated agent cannot invoke host-side capability — tool execution,
