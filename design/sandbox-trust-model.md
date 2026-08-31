@@ -26,12 +26,16 @@ bridge proxy's startup sequence.
 
 **A principal's ability to reach a channel is not permission to use it.**
 
-Inspect deliberately establishes a privilege boundary *inside* the sandbox
-container: the evaluated agent is untrusted, and the tool server that serves it
-is not. Every channel that crosses that boundary — the tool RPC socket, the
-model proxy, the service mailbox — must therefore authenticate its caller and
-authorize the specific operation requested. Filesystem permissions on a
-well-known path control *reachability*; they are not a substitute for identity.
+Inspect establishes a privilege boundary *inside* the sandbox only when the
+tools processes and the evaluated agent actually run under different UIDs. The
+evaluated agent is untrusted; where that split exists, the tool server that
+serves it is a separate trusted principal. Sandbox services independently
+establish a container-to-host boundary whether or not the UID split exists.
+Every channel crossing either boundary — the tool RPC socket, the model proxy,
+the service mailbox — must authenticate its caller and authorize the specific
+operation requested. Filesystem permissions on a well-known path control
+*reachability* only between different principals; they are not a substitute for
+identity.
 
 Two corollaries follow, and both are load-bearing:
 
@@ -46,10 +50,12 @@ Two corollaries follow, and both are load-bearing:
 
 ### Principals and privilege zones
 
-A container running an eval holds at least two principals. When the sandbox
-provides root, injection creates the tools tree as root and restricts it to mode
-`0700`, so the evaluated agent can neither read nor execute the tooling that
-serves it (`tool/_sandbox_tools_utils/sandbox.py:111-141`).
+The number of in-container principals is a runtime property, not a constant.
+The diagram below depicts the two-principal configuration: the sandbox's
+default user is non-root and injection can execute as root. Injection then
+creates the tools tree as root and restricts it to mode `0700`, so the evaluated
+agent can neither read nor execute the tooling that serves it
+(`tool/_sandbox_tools_utils/sandbox.py:111-141`).
 
 ```mermaid
 flowchart TB
@@ -59,7 +65,7 @@ flowchart TB
     end
 
     subgraph container["sandbox container"]
-        subgraph rootzone["tools user — root where available"]
+        subgraph rootzone["tools user — root"]
             CLI["tools CLI<br/>short-lived, one per call"]
             DAEMON["tool server daemon<br/>long-lived, holds state"]
             TREE["/var/tmp/.da7be258e003d428<br/>tools tree, mode 0700"]
@@ -86,6 +92,22 @@ flowchart TB
     class host,EVAL,KEYS trusted
 ```
 
+The other configurations collapse those two zones:
+
+| Configuration | Agent and plain commands | `_tools_user` and tools processes | Boundary A |
+|---|---|---|---|
+| Root exec succeeds; default user is root | root | `"root"` / root | Absent — same UID |
+| Root exec succeeds; default user is non-root | default non-root UID | `"root"` / root | **Present** |
+| Root exec is unavailable; any default UID | default UID | `None` / default UID | Absent — same UID |
+
+`_tools_user` starts as `None` (`util/_sandbox/environment.py:137`) and is set to
+`"root"` only when the root directory probe succeeds. On fallback, injection,
+the CLI, and the daemon all run as the sandbox default UID. Mode `0700` cannot
+separate processes sharing that UID. Boundary A therefore requires both a
+non-root default user *and* successful root execution; either fact alone is
+insufficient. Collapsing Boundary A does not collapse Boundaries B or C; their
+independent presence conditions below are unchanged.
+
 ### Processes in a container
 
 The injected executable is not one daemon; it is a multi-call binary
@@ -94,9 +116,9 @@ The injected executable is not one daemon; it is a multi-call binary
 
 | Process | Lifetime | Runs as | Serves |
 |---|---|---|---|
-| **Tools CLI** (`exec`) | One per host tool call | Started as `_tools_user` (root); may `setuid` down to `_run_as_user` for in-process tools | Executes *stateless* tools itself; otherwise acts as a client to the daemon |
-| **Server daemon** (`start-server`) | Container lifetime | root, stays root | *Stateful* tools; switches user per job via `preexec_fn` |
-| **Model proxy** (`model_proxy`) | Bridge session (Pattern 2 only) | root — spawned by the daemon as an `exec_remote` job with no `user`, so it inherits the daemon's identity | Relays model calls from a sandboxed agent |
+| **Tools CLI** (`exec`) | One per host tool call | `_tools_user`: root after a successful root probe, otherwise the default UID; may `setuid` only when root | Executes *stateless* tools itself; otherwise acts as a client to the daemon |
+| **Server daemon** (`start-server`) | Container lifetime | `_tools_user`; switches user per job only when root | *Stateful* tools |
+| **Model proxy** (`model_proxy`) | Bridge session (Pattern 2 only) | Inherits the daemon because its `exec_remote` job has no `user`; root only when the daemon is root | Relays model calls from a sandboxed agent |
 | **Command processes** | Per command | Agent user, or a user named by the caller | The actual work |
 
 The CLI routes on a static list (`_cli/main.py:151-194`): if the requested
@@ -112,15 +134,18 @@ Three consequences worth keeping in view:
 
 - **The unix socket is a CLI→daemon channel**, not a host→container one. The
   host never speaks to the daemon directly; it always goes through a fresh CLI
-  process. Neither endpoint is intended to be reachable by the agent.
-- **Stateless tools run in the CLI, as root.** Defects in `text_editor` are
-  root-privileged defects in a *short-lived* process, not in the daemon — the
-  daemon's hardening does not cover them.
-- **Both privileged processes create the runtime directory.** The CLI creates it
+  process. Neither endpoint is intended to be reachable by the agent, although
+  UID permissions cannot enforce that in a single-principal container.
+- **Stateless tools run in the CLI, as the tools user.** In the two-principal
+  configuration, defects in `text_editor` are root-privileged defects in a
+  *short-lived* process, not in the daemon — daemon hardening does not cover
+  them. In rootless fallback they run as the default UID instead.
+- **Both tools processes create the runtime directory.** The CLI creates it
   first (`_cli/main.py:200-203`, before the daemon exists), and the daemon later
-  applies the mode (`_cli/server.py:144-146`). This is the two-creation-site
-  split that Hardening item 1 addresses; it exists because these are two
-  genuinely different processes, not one.
+  applies the mode (`_cli/server.py:144-146`). Both are privileged in the
+  two-principal configuration. This is the two-creation-site split that
+  Hardening item 1 addresses; it exists because these are two genuinely
+  different processes, not one.
 
 Data returns along the channel it was requested on: the stdout of the `exec` the
 host initiated. **On the tool-execution path the untrusted zone has no inbound
@@ -141,12 +166,9 @@ consequence: an agent can run commands through the plain path *before* any
 stateful tool has triggered injection, which is what makes the directories
 described below pre-creatable.
 
-The boundary exists only where the sandbox default user is *not* root. In a
-container whose default user is root there is no in-container boundary at all,
-and containment rests entirely on the container runtime.
-
-`_tools_user` (`util/_sandbox/environment.py:137`) records which user won that
-negotiation and is replayed as the `user=` of every subsequent tool exec.
+`_tools_user` records the result of the root probe and is replayed as the
+`user=` of every subsequent tool exec. `None` deliberately means "use the
+sandbox default user"; it does not name a separate rootless tools principal.
 
 ### Delivery
 
@@ -223,10 +245,10 @@ sequenceDiagram
 Direction is host → sandbox, synchronous, one exec per call
 (`util/_sandbox/_json_rpc_transport.py:43`). Inspect sees every tool call and
 can refuse it. Untrusted output crosses the boundary as the *response* to a
-request the host made — a privileged process (the CLI, or the daemon behind it)
-is a conduit for it, which is why content-handling defects in that path (and in the
-transcript and display layers that consume it) are part of this boundary even
-though they are not privilege escalations.
+request the host made — a tools process (privileged in the two-principal
+configuration) is a conduit for it, which is why content-handling defects in
+that path, and in the transcript and display layers that consume it, are part of
+this boundary even when they are not privilege escalations.
 
 #### Tool user confinement
 
@@ -267,11 +289,14 @@ through the host. Two defects:
 
 - **The wire is unauthenticated.** Confinement binds only callers that come
   through the host; anything reaching the socket directly supplies its own
-  user, and the tool's schema is irrelevant to it.
-- **It fails open.** For in-process tools the CLI starts as root and drops
-  privilege only `if run_as_user is not None` (`_cli/main.py:172-179`). An
-  absent or stripped field means the tool runs as root — so this misfires on a
-  legitimate call that merely omits the field, not only under attack.
+  user, and the tool's schema is irrelevant to it. This becomes cross-UID
+  escalation only when the daemon is root; in rootless fallback, user switching
+  is disabled but host mediation is still bypassed.
+- **It fails open in the two-principal configuration.** For in-process tools the
+  CLI starts as root and drops privilege only `if run_as_user is not None`
+  (`_cli/main.py:172-179`). An absent or stripped field means the tool runs as
+  root — so this misfires on a legitimate call that merely omits the field, not
+  only under attack.
 
 **A maintenance hazard, not a current weakness.** The target user travels
 in-band, as an ordinary field of the request — `SubmitParams.user`,
@@ -287,14 +312,15 @@ maintained independently at each call site rather than by the protocol: a future
 tool that builds its params as `{**model_args}` would make it live, and nothing
 would catch that.
 
-These need separate fixes. Hardening item 3 removes the attack: once only the
-host's root CLI can reach the socket, no unauthenticated caller can name its own
-user. Fail-open is not covered by it and must be fixed on its own, because it
-misfires on a legitimate call that simply omits the field — confinement should
-fail closed: no named user, no privileged execution. Carrying the target user
-outside the request body would retire the maintenance hazard as well, but that
-is robustness work, not remediation, and should not be scheduled as though it
-closed a hole.
+These need separate fixes. In the two-principal configuration, Hardening item 3
+removes the attack: once only the host's root CLI can reach the socket, no
+unauthenticated caller can name its own user. It cannot make that claim in a
+single-principal container, where the agent shares the CLI's UID. Fail-open is
+not covered by it and must be fixed on its own, because it misfires on a
+legitimate call that simply omits the field — confinement should fail closed:
+no named user, no privileged execution. Carrying the target user outside the
+request body would retire the maintenance hazard as well, but that is robustness
+work, not remediation, and should not be scheduled as though it closed a hole.
 
 ### Pattern 2 — sandboxed agent via the bridge
 
@@ -352,22 +378,25 @@ used to stand up the bridge. `sandbox_agent_bridge()` calls
 `sandbox_with_injected_tools()` (`sandbox/bridge.py:140`), and the proxy is
 started as an `exec_remote` job — so the injected binary *is* the proxy program,
 and because `exec_remote` is a stateful tool, that one launch traverses the
-whole Pattern 1 stack: host → CLI (root) → daemon (root) → proxy. After startup
-the agent talks only to the proxy over loopback and never reaches the CLI or
-daemon again.
+whole Pattern 1 stack: host → CLI (tools user) → daemon (tools user) → proxy.
+After startup the agent talks only to the proxy over loopback and never reaches
+the CLI or daemon again through the intended path.
 
 One consequence is easy to miss. The bridge sets `concurrency`, `env`, and
 `poll_timeout` but not `options.user`, and the target user is forwarded only
 `if self._options.user` (`util/_sandbox/exec_remote.py:320-321`). The job
-therefore inherits the daemon's identity, so **the model proxy runs as root** —
-and it is the unauthenticated loopback listener described below.
+therefore inherits the daemon's identity. **The model proxy runs as root only
+when the tools daemon does**; under rootless fallback it runs as the same
+default UID as the agent. In either case it is the unauthenticated loopback
+listener described below.
 
-**What that does and does not grant.** It does not by itself give a container
-process root: the proxy exposes model relay and bridged-tool invocation, and
-neither runs a command in the container. Root here is a blast-radius and
-least-privilege problem — a file-handling defect in a handler would be
-root-privileged, its mailbox files are root-owned, and it voids the "non-root,
-nothing to escalate to" reasoning used to justify permissive modes elsewhere.
+**What that does and does not grant.** In a root-capable configuration it does
+not by itself give a container process root: the proxy exposes model relay and
+bridged-tool invocation, and neither runs a command in the container. Its root
+identity is a blast-radius and least-privilege problem — a file-handling defect
+in a handler would be root-privileged and its mailbox files are root-owned. In
+rootless fallback there is no root uplift, but the unauthenticated host
+capability remains.
 
 The escalation the bridge actually grants is **to host-side capability rather
 than to container root**: any container process can reach the proxy and invoke
@@ -431,7 +460,7 @@ answer for a given defect.
 
 | Boundary | What it separates | Present in |
 |---|---|---|
-| **A — In-container privilege** | agent user ↔ tools user | Both patterns, whenever tooling is injected |
+| **A — In-container privilege** | agent user ↔ tools user | Both patterns, only when the default user is non-root and root exec succeeds |
 | **B — Container → host capability** | container ↔ Inspect process | Wherever a sandbox service runs: the bridge, the human agent |
 | **C — Mediation** | what the agent does ↔ what Inspect can refuse and record | Both, but with very different strength |
 
@@ -468,8 +497,9 @@ without asking. Pattern 2 therefore substitutes containment for mediation, which
 is why withholding provider-side tools and authenticating the proxy matter more
 there than any approval policy does.
 
-Boundary A, by contrast, is identical in both patterns: both inject the same
-binary and run the same privileged processes.
+Boundary A, by contrast, has the same presence condition in both patterns: both
+inject the same binary, and both obtain a distinct privileged tools principal
+only when the root probe succeeds while the default user is non-root.
 
 ### Explicitly out of scope
 
@@ -478,8 +508,11 @@ binary and run the same privileged processes.
   addresses none of the guarantees above: boundary A is internal to the guest,
   and boundaries B and C are channels Inspect deliberately provides across the
   isolation layer, which a stronger isolation layer does not authenticate.
-- **Containers whose default user is root.** No in-container boundary exists;
-  guarantees 1 and 2 are vacuous.
+- **Single-principal containers, for Boundary A.** No agent↔tools privilege
+  boundary exists when the sandbox default user is root or when root exec is
+  unavailable. Guarantees 1 and 2 are not supplied there, and escalation across
+  Boundary A is vacuous. Boundaries B and C remain in scope: sharing a UID does
+  not authorize the container to invoke host capabilities or bypass mediation.
 - **Denial of service by the agent against its own tooling.** An agent can
   decline to cooperate regardless; self-inflicted unavailability is not a
   security boundary. Cross-principal DoS is in scope.
@@ -537,8 +570,8 @@ with the target user an ordinary wire parameter (`SubmitParams.user`,
 (`_job.py:74-101`). The effective rule is *"if this daemon is root, any socket
 client may name any user, including root."*
 
-The bridge proxy — which runs as root, per the note above — is unauthenticated
-on container loopback
+The bridge proxy — which runs with the tools identity, root whenever the root
+probe succeeds — is unauthenticated on container loopback
 (`_agent_bridge/proxy.py:52-58`, port 13131), which every process and uid in the
 container shares, and serves `Access-Control-Allow-Origin: *`
 (`proxy.py:197-205`) to browsed content. Its handlers call `os._exit(1)` on
@@ -589,12 +622,13 @@ intended to become.
 
 Ordered by leverage and dependency. Item 2 depends on item 1: direct archive
 streaming is safe only after the extraction destination has been verified.
-Items 1 and 3 are independent and both are required: verified directories
-control *reachability*, while peer authentication controls *identity*. Neither
-substitutes for the other, because a correctly permissioned directory still
-hands out privileged operations to anything that obtains a descriptor on the
-socket. Item 4 is independent again: authenticating the browser's caller does
-not make every browser navigation safe.
+Where Boundary A exists, items 1 and 3 are independent and both are required:
+verified directories control *reachability*, while peer authentication controls
+*identity*. Neither substitutes for the other, because a correctly permissioned
+directory still hands out privileged operations to anything that obtains a
+descriptor on the socket. Neither control separates processes that share a UID.
+Item 4 is independent again: authenticating the browser's caller does not make
+every browser navigation safe.
 
 ### 1. One verified-directory helper, used everywhere
 
@@ -702,14 +736,24 @@ treating the server as live or forwarding a request. This reuses `peer_uid` and
 the protocol-level integration already proven in `_control/server.py`, extended
 to the client side so a rogue listener cannot impersonate the daemon.
 
-This is the control that actually addresses discovery — it does not matter that
-the agent can enumerate the socket path from `/proc/net/unix`. It renders
-`_can_switch_user` moot as an escalation vector: that flag remains a privilege
-test, but the question it was standing in for — *may this caller switch user?* —
-is now answered at the connection, before any request is parsed. Client-side
-verification closes the converse failure: `_can_connect_to_socket()` currently
-treats any live listener as the intended server and suppresses legitimate server
-startup (finding 3674518).
+In the two-principal configuration, this is the control that actually addresses
+discovery — it does not matter that the agent can enumerate the socket path from
+`/proc/net/unix`. It renders `_can_switch_user` moot as an escalation vector:
+that flag remains a privilege test, but the question it was standing in for —
+*may this caller switch user?* — is now answered at the connection, before any
+request is parsed. Client-side verification closes the converse failure:
+`_can_connect_to_socket()` currently treats any live listener as the intended
+server and suppresses legitimate server startup (finding 3674518).
+
+**Single-principal limitation.** In rootless fallback, the CLI, daemon, and
+agent all run under the sandbox default UID. A peer-UID check therefore accepts
+the agent, and a mode-`0700` directory owned by that UID cannot exclude it. This
+item does not claim agent↔tools isolation in that configuration. Providing it
+would require a distinct tools UID. A capability protocol could substitute only
+if its secret were delivered and stored through a channel demonstrably hidden
+from same-UID processes; ordinary arguments, environment variables, and files
+do not create that boundary. Peer credentials alone cannot distinguish same-UID
+processes.
 
 The same-UID rule applies to both packages. `inspect_tool_support` currently
 creates a `0666` socket under the stated rationale that root, non-root, and
@@ -721,14 +765,18 @@ not carried forward as an authentication exception. Its socket moves to an
 owner-verified private directory and no longer uses a world-connectable mode.
 If a future feature genuinely requires cross-UID callers, it needs a separately
 designed allow-list or capability protocol rather than reopening this socket.
+When the browser service and agent deliberately share the default UID, the
+private directory excludes other UIDs but not the agent; items 4 and 5 remain
+necessary for browser-input and per-session protection.
 
-Note what this does *not* require, and what it does not fix. It does not require
-an allow-list of permissible target users: once the only authenticated caller is
-the host's own root CLI, naming a user over the socket is not an escalation,
-because a caller that passes the peer check is already root and could `setuid`
-without asking. That would only become a real constraint if authenticated
-callers were ever widened below root — for example if the CLI dropped privilege
-before forwarding, making "caller uid X may request only user X" meaningful.
+Note what this does *not* require, and what it does not fix. In the
+two-principal configuration it does not require an allow-list of permissible
+target users: once the only authenticated caller is the host's own root CLI,
+naming a user over the socket is not an escalation, because a caller that passes
+the peer check is already root and could `setuid` without asking. That would
+become a real constraint if authenticated callers were ever widened below root
+— for example if the CLI dropped privilege before forwarding, making "caller
+uid X may request only user X" meaningful.
 
 Nor does it fix the fail-open default in tool user confinement, which misfires
 on legitimate calls rather than under attack and needs its own fix.
@@ -748,8 +796,8 @@ This is remediation for finding 3673737. Today, `file://`, `chrome://`,
 unchanged. When the legacy browser runs as root, a model-authorized call such as
 `file:///etc/shadow` reads with root authority and returns the result through
 the accessibility tree. Item 3 does not prevent that call: same-UID peer
-authentication excludes an unintended socket client, but the evaluated model
-is the intended caller and the browser is the confused deputy.
+authentication may exclude a different-UID socket client, but the evaluated
+model is the intended caller and the browser is the confused deputy.
 
 As defense in depth, Chromium runs as a dedicated non-root browser user even
 when its supervising tool service is privileged. This limits filesystem
@@ -768,22 +816,26 @@ returned only to the creator and checked on every operation. If a future
 authentication design admits multiple principals, bind each handle to the
 authenticated creator as an additional check.
 
-**Exploitable today.** Before item 3 lands, any container process that reaches
-the socket can name `BashSession` or `WebBrowser` — the namespace is fully
-enumerable — and act on a session it did not create. `session_for_name` is a
-bare dict lookup, so naming is sufficient. Concretely: the model's browser
-session carries live authenticated cookies, and an attaching process can read
-rendered pages and issue state-changing requests under that identity; a bash
-session created with `user=` yields a shell as that user; and for `exec_remote`,
-a guessed PID accepts `exec_remote_write_stdin`, injecting input into a
-root-owned job.
+**Exploitable today.** Any container process that reaches the socket can name
+`BashSession` or `WebBrowser` — the namespace is fully enumerable — and act on a
+session it did not create. Before item 3 this includes other UIDs; in a
+single-principal container it continues to include the agent after item 3.
+`session_for_name` is a bare dict lookup, so naming is sufficient. Concretely:
+the model's browser session carries live authenticated cookies, and an attaching
+process can read rendered pages and issue state-changing requests under that
+identity; a bash session created with `user=` yields a shell as that user; and
+for `exec_remote`, a guessed PID accepts `exec_remote_write_stdin`, injecting
+input into a root-owned job when the daemon is root.
 
-**After item 3.** This becomes defense in depth rather than an independently
-load-bearing cross-UID control: a process under another UID cannot reach either
-server. Capability handles still limit damage from a leaked socket descriptor,
-a same-UID co-process, or a future authentication regression. Peer credentials
-cannot distinguish processes that deliberately share a UID, so the random
-handle itself is the authority in that case; describing this as UID-based owner
+**After item 3 in the two-principal configuration.** This becomes defense in
+depth rather than an independently load-bearing cross-UID control: a process
+under another UID cannot reach either server. In a single-principal container,
+capability handles prevent blind session-name guessing by the same-UID agent or
+co-process, provided the handles remain confidential. They do not authenticate
+RPC methods that create new state, and they do not by themselves establish a
+robust same-UID boundary: that still requires a distinct UID or a protocol-wide
+capability with protected delivery. Peer credentials cannot distinguish
+processes that deliberately share a UID, so describing this as UID-based owner
 isolation would overstate the boundary.
 
 ### 5a. `Job.kill()` process-state guard — a correctness fix
@@ -842,8 +894,10 @@ Worth adding later as defense in depth; not a substitute for item 1.
 
 The largest available reduction in attack surface is to stop running a
 privileged daemon alongside an untrusted agent — one disposable container per
-sample, agent as root, nothing to escalate to. Most concerns in this document
-become vacuous rather than defended.
+sample, agent as root, nothing to escalate to. The default-root and rootless
+fallback configurations already collapse Boundary A, although only the former
+makes the agent root. Most Boundary A concerns then become vacuous rather than
+defended; Boundaries B and C do not.
 
 This is a product decision, not solely a security one: evaluations that hide
 root-owned scoring assets from the agent, or that need the agent deliberately
