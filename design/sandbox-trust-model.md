@@ -158,12 +158,13 @@ That property belongs to the tool path, not to Pattern 1 as a whole. Any
 agent has an inbound channel regardless of which pattern drives the eval.
 
 Note that plain `bash()`/`python()` (`tool/_tools/_execute.py:105`) go straight
-to `sandbox.exec()` and never touch the injected binary or the tool server; only
-stateful tools — `bash_session`, `text_editor`, sandbox MCP — use the daemon
-(`tool/_tools/_bash_session.py:196-199`,
+to `sandbox.exec()` and never touch the injected binary or the tool server.
+`bash_session`, `text_editor`, and sandbox MCP all use the injected tooling, but
+only the stateful `bash_session` and MCP paths traverse the daemon;
+`text_editor` dispatches locally in the short-lived CLI (`_cli/main.py:151-194`,
 `tool/_tools/_text_editor.py:112-136`). This asymmetry has a security
 consequence: an agent can run commands through the plain path *before* any
-stateful tool has triggered injection, which is what makes the directories
+injected tool has triggered injection, which is what makes the directories
 described below pre-creatable.
 
 `_tools_user` records the result of the root probe and is replayed as the
@@ -216,7 +217,7 @@ sequenceDiagram
     box rgb(255, 240, 220) Sandbox container
         participant P as command process<br/>(agent user)
         participant CLI as tools CLI<br/>(per invocation)
-        participant D as tool server<br/>(long-running, root)
+        participant D as tool server<br/>(long-running, tools user)
     end
 
     AG->>AG: model.generate() → tool_calls
@@ -446,11 +447,21 @@ exists to contain. We assume it can run arbitrary code as the sandbox default
 user, read this repository, enumerate processes and sockets in the container,
 and create files anywhere that user can write.
 
-Two secondary positions matter. A **co-resident container process** may run as a
-different uid than the agent — a deliberately deprivileged agent alongside a more
-privileged default user, or a sidecar sharing the network namespace.
-**Browsed web content** is attacker-influenced input rendered inside the
-container, and can issue requests to container-local services.
+Four secondary positions matter:
+
+- A **co-resident container process** may run as a different uid than the agent
+  — a deliberately deprivileged agent alongside a more privileged default user,
+  or a sidecar sharing the network namespace.
+- **Browsed web content** is attacker-influenced input rendered inside the
+  container, and can issue requests to container-local services.
+- In a human-agent eval, **task software shares the interactive user's UID**. It
+  can invoke the same mailbox service as the human-facing CLI; peer UID and a
+  token stored in that user's arguments, environment, or files cannot prove
+  that a request expresses human intent.
+- **Persisted or configured path data** — notably Skill supporting-file keys,
+  session-log entries, and checkpoint contents — may later be consumed by a
+  more privileged process. It remains untrusted even when it arrives through a
+  nominally trusted host API.
 
 ### What the boundary must guarantee
 
@@ -488,6 +499,13 @@ Two of these mean materially different things in each pattern:
 surface, but the human agent exposes submission, scoring, and clock methods to
 any process in the container over the same mailbox mechanism. An eval driven
 entirely by Pattern 1 that uses the human agent still owes guarantee 3.
+
+Human intent is not presently a separate operating-system principal. The human
+and arbitrary task code normally share a UID, so authenticating a mailbox
+request as that UID establishes possession, not authorship by the human. A
+state transition that specifically requires human intent therefore needs
+host-side confirmation or a separately protected principal; moving a bearer
+token among same-UID-readable channels does not create that distinction.
 
 **Guarantee 4 is strong in Pattern 1 and weak in Pattern 2.** When Inspect
 executes tools it can refuse absolutely: a declined call does not run. When the
@@ -578,6 +596,13 @@ container shares, and serves `Access-Control-Allow-Origin: *`
 error (`proxy.py:1417`, `:1639`). Its backing mailbox sits under a `1777` parent
 (`util/_sandbox/service.py:29-30`).
 
+Authentication would still leave an authorization gap. Bridge requests can
+select aliases, roles, or arbitrary provider/model names through
+`resolve_inspect_model()` (`agent/_bridge/util.py:369-387`), causing the host to
+use credentials and models beyond the active eval model. An authenticated
+sandbox agent is not thereby authorized for every provider configured in the
+Inspect process (finding 3672034).
+
 The route by which an in-container caller reaches host-side execution is worth
 stating in full, because no step in it is an escape — every step is the designed
 mechanism. A `tools/call` to `http://localhost:<port>/mcp/<server>` becomes a
@@ -595,6 +620,15 @@ through the `bridge_generate` approval chokepoint (`agent/_bridge/util.py:341`)
 and emits no tool event. The single-chokepoint design is sound only if the
 chokepoint is the sole route.
 
+The human-agent service makes the same reachability mistake. The CLI validates
+submit answers and asks for confirmation before `submit` or `quit`, but the
+service methods that mutate `HumanAgentState` do neither
+(`agent/_human/commands/submit.py:48-163`). `score` exposes the scorer without a
+server-side attempt or rate limit (`commands/score.py:52-75`), and any mailbox
+caller can stop or restart the clock (`commands/clock.py:29-60`). Because task
+software and the interactive shell share a UID, authenticating only that UID
+cannot restore the missing distinction between automation and human intent.
+
 ### 3. Privileged components act on agent-influenced inputs
 
 Path-based operations that follow symlinks, environment variables that redirect
@@ -603,6 +637,16 @@ privileged lookups (`XDG_RUNTIME_DIR`/`HOME` in
 attacker-influenced paths (`_text_editor/text_editor.py:27-34` interpolating
 into `create_subprocess_shell`), and serialized formats permitting code
 execution all let the agent choose what a privileged component acts upon.
+The Skill installer joins unvalidated supporting-file keys beneath `scripts`,
+`references`, and `assets`, then may `chown` the resulting path as root
+(`tool/_tools/_skill/install.py:73-96`). Checkpoint ingress restores the latest
+snapshot as root with an unconstrained `--target /`
+(`util/_checkpoint/_sandbox_restic/egress.py:88-100`). Human-agent session-log
+collection splits `ls` output into path components and passes each joined path
+to `sandbox().read_file()` without no-follow or aggregate-size constraints
+(`agent/_human/commands/submit.py:28-46`). In each case, a trusted operation is
+steered by untrusted names or objects.
+
 Numeric process identifiers create the same problem across time: after the
 agent's child exits, `Job.kill()`, retirement, and bash-session shutdown can
 reuse its stale PID/PGID in root `killpg()` or group-membership scans. The agent
@@ -634,7 +678,10 @@ verified directories control *reachability*, while peer authentication controls
 directory still hands out privileged operations to anything that obtains a
 descriptor on the socket. Neither control separates processes that share a UID.
 Item 4 is independent again: authenticating the browser's caller does not make
-every browser navigation safe.
+every browser navigation safe. Items 7 and 8 defend Boundary B at its two
+inbound services. Item 9 confines the objects on which privileged filesystem
+operations may act; item 10 verifies the code and content consumed at that
+boundary.
 
 ### 1. One verified-directory helper, used everywhere
 
@@ -676,16 +723,16 @@ the socket at all. The two items are complementary, not alternatives.
 whenever untrusted code executes in the container before the first injection.
 Pattern 1 opens it routinely: plain `bash()`/`python()` call
 `sandbox.exec()` directly and never trigger injection, so an agent that runs a
-shell command before its first stateful tool call acts while both directories
+shell command before its first injected tool call acts while both directories
 are still absent. Pattern 2 closes it for the evaluated agent, because
 `sandbox_agent_bridge()` injects during setup (`sandbox/bridge.py:140`) and only
 yields to the agent afterwards — the directories already exist, root-owned and
-`0700`, before any agent code runs. Two corollaries follow: an eval configured
-with only stateful tools has no window either, since its first tool call
-performs the injection; and Pattern 2 is still exposed to anything that ran
-*earlier* in the container's life — entrypoints, `sample_init`, and task setup
-scripts — which matters wherever those are influenced by dataset content rather
-than fixed by the eval author.
+`0700`, before any agent code runs. Two corollaries follow: an eval whose first
+model-controlled container action must use injected tooling has no window
+either, since that first call performs the injection; and Pattern 2 is still
+exposed to anything that ran *earlier* in the container's life — entrypoints,
+`sample_init`, and task setup scripts — which matters wherever those are
+influenced by dataset content rather than fixed by the eval author.
 
 The fix: every site that creates or opens a privileged directory routes through
 a single helper that opens with `O_NOFOLLOW`, verifies ownership and type on the
@@ -702,8 +749,31 @@ sites, the tools tree, and the equivalent directories in
 by path (`json_rpc_chunking.py:200-218`) resolve once and read from the verified
 descriptor.
 
+The human-agent installer needs a stronger specialization of this rule. Its
+current flow creates a fixed staging directory, deliberately transfers that
+directory to the target user, writes `install.sh` into it, and executes the
+script in a later operation (`agent/_human/install.py:35-52`). Once staging has
+been made writable by an untrusted UID, verifying the directory at creation
+does not make a later path-based write or execution safe.
+
+Remove that executable staging step. The host should perform the small set of
+installation operations directly: root creates and retains ownership of
+`/opt/human_agent`; generated files are opened beneath it with no-follow,
+descriptor-relative operations and made readable or executable, but not
+writable, by the target user; and the target user's `.bashrc` is opened as an
+expected regular file without following a replacement link. Root-only setup
+uses argument vectors and exact paths, while user-level changes run explicitly
+as the target user. No process executes a script from a directory that the
+target user could replace. If a user-level generated script must remain, keep
+it in a root-owned private directory and supply it through an already-open
+descriptor or stdin to an interpreter running explicitly as the target user
+rather than reopening a mutable path.
+
 A mechanical test should assert no other site creates these directories, so the
-next component cannot reintroduce the pattern.
+next component cannot reintroduce the pattern. Installer tests should preplant
+both symlinks and real directories and exercise a replacement between write and
+use; no root write, ownership change, or execution may escape the verified
+destination.
 
 This is stateless: no bookkeeping, works when reconnecting to a pre-existing
 container, and cannot be defeated by discovery.
@@ -725,7 +795,7 @@ by the host and the archive descriptor consumed by root, so there is no path for
 the agent to pre-create, replace, symlink, or modify between transfer and
 extraction. The destination must already have passed the ownership, type, and
 `0700` checks above; a non-zero decoder or tar result fails injection. This does
-not replace item 8's source-authenticity check: strict digests establish which
+not replace item 10's source-authenticity check: strict digests establish which
 bytes the host may send, while direct streaming preserves that binding through
 root extraction.
 
@@ -891,16 +961,91 @@ descendants of the original job must still be cleaned up.
 
 ### 7. Bridge: authenticate the proxy and close the second entry point
 
-The model proxy issues a per-run bearer token, delivered by the same mechanism
-that already carries its base URL. CORS is disabled or restricted to an explicit
-allowlist. Handler failures return 5xx rather than `os._exit(1)`. Mailbox files
-are created with restrictive modes and `O_EXCL`/`O_NOFOLLOW`.
+The host generates a per-run bearer token, and the model proxy requires it in a
+standard `Authorization: Bearer` header on every generation and MCP request.
+The base URL is public routing information, not a secret-delivery mechanism.
+The integration must deliver the token through a channel protected from every
+principal the token is intended to exclude and keep it out of URLs and logs. A
+token available in arguments, environment, or files authenticates possession
+only; it cannot distinguish the intended client from co-resident code under the
+same UID. If that distinction is required, run the client under a separate UID
+or put the operation behind a protected host-controlled broker.
+
+Authentication does not grant arbitrary use of host provider credentials.
+Unless the eval author configures otherwise, bridge requests may resolve only
+to the active, pinned eval model. Aliases, model roles, and additional
+provider/model names require an explicit operator allowlist; all other names
+are rejected rather than passed to `get_model()` or silently replaced by a
+broad fallback. A table-driven test should cover direct names, the bare
+`inspect` name, aliases, roles, and every fallback combination.
+
+CORS is disabled or restricted to an explicit allowlist, closing the browser
+origin route in finding 3672974. Handler failures return 5xx rather than
+`os._exit(1)`. Mailbox files are created with restrictive modes and
+`O_EXCL`/`O_NOFOLLOW`.
 
 Separately, `call_tool` must pass through the same approval chain as any other
 tool call and emit a `ToolEvent`. This preserves the single-chokepoint design
 rather than replacing it, and closes the observability gap noted above.
 
-### 8. Verify what runs as root
+### 8. Mediate human-agent service actions at the host
+
+Every human-agent mailbox request is untrusted input, including one produced by
+the installed CLI. The service, not the CLI, authoritatively checks that the
+task is running, that a required answer is present and matches the complete
+configured format (`fullmatch` for a regex policy), and that the requested
+transition is legal. Terminal transitions are serialized and idempotent so
+concurrent requests cannot submit twice or resume a completed task.
+
+`submit` and `quit` also require evidence of intent that arbitrary task software
+cannot manufacture. The preferred control is confirmation in a host/operator
+UI. An alternative is a human interface running as a genuinely separate
+principal and authenticating through a channel inaccessible to the task UID. A
+bearer token stored in the interactive user's environment or files is not that
+control because task code shares the UID. If an eval deliberately permits
+unattended submission, it must opt into that weaker policy explicitly; the
+service records the request's provenance instead of treating the CLI prompt as
+a security boundary.
+
+Intermediate scoring is enforced server-side with a configured maximum number
+of attempts and minimum interval. It applies the same answer validation before
+running a scorer, returns only the feedback intended by the eval author, and
+records every successful and rejected attempt. Clock changes receive the same
+server-side state checks and provenance recording; configurations in which
+timing affects evaluation policy should require host mediation or the separate
+human principal used for terminal transitions.
+
+Tests invoke the mailbox methods directly, bypassing the CLI, and prove that
+validation, confirmation policy, scoring limits, legal clock transitions, and
+audit events still apply.
+
+### 9. Constrain privileged filesystem operations to declared roots
+
+A privileged component accepts only normalized relative POSIX names for child
+objects. It rejects absolute paths, empty and dot components, `..`, and control
+characters. Lexical validation is followed by
+descriptor-relative, no-follow resolution beneath an already verified root;
+checking a string prefix and then reopening by pathname is not sufficient.
+
+Apply that contract to every Skill supporting-file key before writing or
+changing ownership or mode. The final descriptor must still be beneath the
+specific Skill's `scripts`, `references`, or `assets` directory. Apply the same
+contract to human-agent session logs: enumerate single path components without
+parsing newline-delimited `ls`, accept only regular no-follow files beneath
+`RECORD_SESSION_DIR`, and impose file-count, per-file, and aggregate-byte limits
+before returning data to the host.
+
+Checkpoint resume does not restore an untrusted snapshot directly as root to
+`/`. Bind the checkpoint to its authenticated source and declared include-path
+manifest, restore into a root-owned staging directory, and validate every entry
+before installing it. Reject paths outside the declared roots, unsafe symlinks,
+device nodes, unexpected ownership, and setuid/setgid bits. Install validated
+files with the expected target user and metadata rather than preserving
+arbitrary archive ownership. Tests supply traversal names, symlink swaps,
+special files, and out-of-scope checkpoint entries and assert that no write,
+`chown`, `chmod`, or restore escapes the declared root.
+
+### 10. Verify privileged code and content before use
 
 `INSPECT_SANDBOX_TOOLS_STRICT_DIGESTS` becomes enforcing by default, since the
 artifact is executed as the tools user. Privileged components stop consuming
@@ -952,9 +1097,9 @@ hardening items above. Identifiers are Claude Security finding ids.
 |---|---|---|
 | 3672032 | Pre-occupied server dir reaches root RPC server | 1, 3 |
 | 3672959 | Pre-created tools dir swaps root-executed launcher | 1 |
-| 3672960 | Archive staged unprivileged, extracted by root | 1, 2, 8 |
+| 3672960 | Archive staged unprivileged, extracted by root | 1, 2, 10 |
 | 3672962 | Agent-created file at CLI path spoofs injection detector | 1 |
-| 3672970 | Root tool deserializes attacker-plantable pickle | 1, 8 |
+| 3672970 | Root tool deserializes attacker-plantable pickle | 1, 10 |
 | 3673732 | CLI trusts agent-writable pid/lock/status files | 1 |
 | 3673733 | Symlink race in per-uid chunk dirs | 1 |
 | 3673720 | Human-agent installer stages in preparable directory | 1 |
@@ -967,8 +1112,16 @@ hardening items above. Identifiers are Claude Security finding ids.
 | 3672977 | Unauthenticated loopback model proxy | 7 |
 | 3672978 | Bridge mailbox world-readable to container uids | 7 |
 | 3672035 | Bridge `call_tool` bypasses approval enforcement | 7 |
-| 3672961 | Digest mismatch only warns; unverified binary run as root | 8 |
-| 3672973 | Command injection via unquoted path in shell string | 8 |
+| 3672034 | Bridge caller can select arbitrary host-configured models | 7 |
+| 3672974 | Wildcard CORS exposes bridge capabilities to browsed content | 7 |
+| 3673716 | Direct human-agent submit/quit bypasses validation and confirmation | 8 |
+| 3673717 | Human-agent scoring is an unlimited oracle | 8 |
+| 3673719 | Task software can manipulate the human-agent clock | 8 |
+| 3672964 | Session-log names steer privileged host reads | 8, 9 |
+| 3672972 | Skill supporting-file paths escape before root ownership changes | 9 |
+| 3673715 | Checkpoint resume restores an untrusted snapshot as root to `/` | 9 |
+| 3672961 | Digest mismatch only warns; unverified binary run as root | 10 |
+| 3672973 | Command injection via unquoted path in shell string | 10 |
 
 ## Worked example: approval bypass via the bridge (findings 3672035, 3672977)
 
@@ -1035,11 +1188,14 @@ this path follows only if the author bridged a tool that itself runs privileged
 in the sandbox (e.g. `bash(user="root")`), at which point the same two requests
 yield root in the container too.
 
-**Why item 7 needs both parts.** Authenticating the proxy stops the
-co-resident-process variant but not the agent itself, which is a legitimate
-peer of the proxy; routing `call_tool` through the approval chain (and emitting
-a `ToolEvent`) closes the bypass for the agent but leaves an unauthenticated
-root listener for every other container process. Neither half suffices alone.
+**Why item 7 needs both parts.** Authenticating the proxy stops only callers
+that cannot obtain its token; it does not distinguish the intended agent from
+co-resident code under the same UID, and the agent itself is a legitimate
+token holder. Routing `call_tool` through the approval chain (and emitting a
+`ToolEvent`) closes the bypass for an authenticated agent but, without
+authentication, leaves the endpoint open to every other container process and
+browsed origin. Neither control suffices alone, and model authorization remains
+a separate check after both.
 
 ## Adopting this document
 
